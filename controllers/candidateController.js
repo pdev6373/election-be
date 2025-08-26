@@ -1,44 +1,12 @@
 const { v4: uuid } = require('uuid');
-const { ethers } = require('ethers');
 const Candidate = require('../models/CandidateModel');
 const cloudinary = require('../utils/cloudinary');
 const HttpError = require('../models/errorModel');
+const fs = require('fs');
 const path = require('path');
 const { mongoose } = require('mongoose');
 const ElectionModel = require('../models/electionModel');
 const voterModel = require('../models/voterModel');
-
-//============================== SIMPLE BLOCKCHAIN VOTE RECORDING
-const recordVoteOnBlockchain = async (electionId, candidateId, voterHash) => {
-  try {
-    const provider = new ethers.JsonRpcProvider(process.env.BLOCKCHAIN_RPC_URL);
-    const wallet = new ethers.Wallet(
-      process.env.BLOCKCHAIN_PRIVATE_KEY,
-      provider,
-    );
-
-    // Create vote data as hex
-    const voteData = ethers.toUtf8Bytes(
-      JSON.stringify({
-        election: electionId,
-        candidate: candidateId,
-        voterHash: voterHash,
-        timestamp: Date.now(),
-      }),
-    );
-
-    // Send transaction with vote data
-    const tx = await wallet.sendTransaction({
-      to: wallet.address, // Send to self
-      value: 0,
-      data: ethers.hexlify(voteData),
-    });
-
-    return await tx.wait();
-  } catch (error) {
-    throw new Error(`Blockchain recording failed: ${error.message}`);
-  }
-};
 
 //============================== ADD CANDIDATE
 // POST : api/candidates
@@ -170,53 +138,31 @@ const voteCandidate = async (req, res, next) => {
   try {
     const { id: candidateId } = req.params;
     const { currentVoterId, selectedElection } = req.body;
-
-    // Create privacy-preserving voter hash
-    const voterHash = ethers.keccak256(
-      ethers.toUtf8Bytes(`${currentVoterId}-${selectedElection}-${Date.now()}`),
-    );
-
-    // Record vote on blockchain
-    const blockchainReceipt = await recordVoteOnBlockchain(
-      selectedElection,
-      candidateId,
-      voterHash,
-    );
-
-    // Continue with existing database operations
+    // get the candidate
     const candidate = await Candidate.findById(candidateId);
     const newVoteCount = candidate.voteCount + 1;
-
+    // update candidate's votes
     const updatedCandidate = await Candidate.findByIdAndUpdate(
       candidateId,
-      {
-        voteCount: newVoteCount,
-        $push: { blockchainTxHashes: blockchainReceipt.hash },
-      },
+      { voteCount: newVoteCount },
       { new: true },
     );
-
-    // Update relationships (existing code)
+    // start session for relationship
     const sess = await mongoose.startSession();
     sess.startTransaction();
-
+    // get the current voter
     let voter = await voterModel.findById(currentVoterId);
+    await voter.save({ session: sess });
+    // get selected election
     let election = await ElectionModel.findById(selectedElection);
-
     election.voters.push(voter);
     voter.votedElections.push(election);
-
     await election.save({ session: sess });
     await voter.save({ session: sess });
     await sess.commitTransaction();
-
-    res.status(200).json({
-      message: 'Vote casted and recorded on blockchain successfully',
-      transactionHash: blockchainReceipt.hash,
-      blockNumber: blockchainReceipt.blockNumber,
-    });
+    res.status(200).json('Vote casted successfully');
   } catch (err) {
-    return next(new HttpError(`Vote failed: ${err.message}`, 500));
+    return next(new HttpError(err));
   }
 };
 
